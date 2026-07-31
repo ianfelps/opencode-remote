@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+**/TestResults/
+.vs/
+.idea/
+*.user
+*.suo
+*.nupkg
+artifacts/
+publish/
+appsettings.Local.json
+.env
+.env.*
+!.env.example

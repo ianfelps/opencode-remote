@@ -1,0 +1,9 @@
+global using OpencodeRemote.Configuration;
+global using OpencodeRemote.OpenCode;
+global using OpencodeRemote.OpenCode.Models;
+global using OpencodeRemote.Persistence;
+global using OpencodeRemote.Sessions;
+global using OpencodeRemote.Sessions.Models;
+global using OpencodeRemote.Telegram;
+global using OpencodeRemote.Telegram.Models;
+global using OpencodeRemote.Tests.TestSupport;

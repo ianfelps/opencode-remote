@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/OpencodeRemote/OpencodeRemote.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OpencodeRemote.Tests/OpencodeRemote.Tests.csproj" />
+  </Folder>
+</Solution>
