@@ -10,7 +10,7 @@ internal sealed class StartupProjectWorker(
 {
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        var state = await coordinator.ActivateProjectAsync(options.ProjectAlias, cancellationToken);
+        var state = await coordinator.InitializeProjectAsync(options.ProjectAlias, cancellationToken);
         runtime.SetSelection(state.SessionId, state.Agent);
     }
 

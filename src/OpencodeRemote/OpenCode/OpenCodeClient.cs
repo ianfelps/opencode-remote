@@ -49,6 +49,11 @@ public sealed class OpenCodeClient : IDisposable
         }
     }
 
+    public async Task<IReadOnlyList<OpenCodeProject>> ListProjectsAsync(CancellationToken cancellationToken)
+    {
+        return await _client.GetFromJsonAsync<List<OpenCodeProject>>("project", JsonOptions, cancellationToken) ?? [];
+    }
+
     public async Task<IReadOnlyList<OpenCodeSession>> ListSessionsAsync(string directory, CancellationToken cancellationToken)
     {
         return await _client.GetFromJsonAsync<List<OpenCodeSession>>(WithDirectory("session", directory), JsonOptions, cancellationToken) ?? [];
@@ -195,7 +200,10 @@ public sealed class OpenCodeClient : IDisposable
         response.EnsureSuccessStatusCode();
     }
 
-    public async Task<string?> GetLatestAssistantTextAsync(string directory, string sessionId, CancellationToken cancellationToken)
+    public async Task<AssistantOutcome?> GetLatestAssistantOutcomeAsync(
+        string directory,
+        string sessionId,
+        CancellationToken cancellationToken)
     {
         var path = WithDirectory($"session/{Uri.EscapeDataString(sessionId)}/message?limit=10", directory, true);
         using var document = await GetJsonAsync(path, cancellationToken);
@@ -208,20 +216,98 @@ public sealed class OpenCodeClient : IDisposable
         {
             if (!message.TryGetProperty("info", out var info)
                 || !info.TryGetProperty("role", out var role)
-                || role.GetString() != "assistant"
-                || !message.TryGetProperty("parts", out var parts))
+                || role.GetString() != "assistant")
             {
                 continue;
             }
 
-            var texts = parts.EnumerateArray()
-                .Where(part => part.TryGetProperty("type", out var type) && type.GetString() == "text")
-                .Select(part => part.TryGetProperty("text", out var textPart) ? textPart.GetString() : null)
-                .Where(text => !string.IsNullOrWhiteSpace(text));
-            return string.Join("\n", texts!);
+            message.TryGetProperty("parts", out var parts);
+            return ParseAssistantOutcome(info, parts);
         }
 
         return null;
+    }
+
+    public async Task<string?> GetLatestAssistantTextAsync(string directory, string sessionId, CancellationToken cancellationToken)
+        => (await GetLatestAssistantOutcomeAsync(directory, sessionId, cancellationToken))?.Text;
+
+    internal static AssistantOutcome ParseAssistantOutcome(JsonElement info, JsonElement parts = default)
+    {
+        var texts = parts.ValueKind == JsonValueKind.Array
+            ? parts.EnumerateArray()
+                .Where(part => part.TryGetProperty("type", out var type) && type.GetString() == "text")
+                .Select(part => part.TryGetProperty("text", out var textPart) ? textPart.GetString() : null)
+                .Where(text => !string.IsNullOrWhiteSpace(text))
+            : [];
+        var error = info.TryGetProperty("error", out var errorElement)
+            ? GetErrorMessage(errorElement)
+            : null;
+        return new AssistantOutcome(GetString(info, "id"), string.Join("\n", texts!), error);
+    }
+
+    internal static string? GetErrorMessage(JsonElement error)
+    {
+        if (error.ValueKind is not JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        string? message = null;
+        if (error.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
+        {
+            message = GetString(data, "message");
+            if (string.IsNullOrWhiteSpace(message) && GetString(data, "responseBody") is { } responseBody)
+            {
+                message = TryGetResponseError(responseBody);
+            }
+        }
+
+        message ??= GetString(error, "message");
+        message ??= GetString(error, "name") switch
+        {
+            "ProviderAuthError" => "O provider recusou a autenticação. Verifique as credenciais configuradas.",
+            "ContextOverflowError" => "O limite de contexto do modelo foi excedido.",
+            "ContentFilterError" => "A solicitação foi bloqueada pelo filtro de conteúdo do provider.",
+            "MessageOutputLengthError" => "A resposta excedeu o limite de saída do modelo.",
+            _ => null,
+        };
+        return SanitizeErrorMessage(message);
+    }
+
+    private static string? TryGetResponseError(string responseBody)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(responseBody);
+            var root = document.RootElement;
+            if (root.TryGetProperty("error", out var error))
+            {
+                if (error.ValueKind == JsonValueKind.String)
+                {
+                    return error.GetString();
+                }
+                if (error.ValueKind == JsonValueKind.Object)
+                {
+                    return GetString(error, "message") ?? GetString(error, "code");
+                }
+            }
+        }
+        catch (JsonException)
+        {
+        }
+        return null;
+    }
+
+    private static string? SanitizeErrorMessage(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return null;
+        }
+
+        const int maxLength = 1500;
+        var sanitized = message.Trim().Replace("\0", "", StringComparison.Ordinal);
+        return sanitized.Length <= maxLength ? sanitized : sanitized[..maxLength] + "...";
     }
 
     public async Task<IReadOnlyList<ConversationMessage>> GetRecentConversationAsync(

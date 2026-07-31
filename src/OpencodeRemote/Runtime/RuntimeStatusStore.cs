@@ -12,7 +12,9 @@ public sealed record RuntimeSnapshot(
     CurrentTaskStatus? Task = null,
     string? Attention = null,
     string? LastError = null,
-    DateTimeOffset? LastEventAt = null);
+    DateTimeOffset? LastEventAt = null,
+    string? Project = null,
+    string? Directory = null);
 
 public sealed class RuntimeStatusStore
 {
@@ -30,6 +32,7 @@ public sealed class RuntimeStatusStore
     public void SetOpenCode(string value) => Update(current => current with { OpenCode = value });
     public void SetTelegram(string value) => Update(current => current with { Telegram = value });
     public void SetEvents(string value) => Update(current => current with { Events = value });
+    public void SetProject(string project, string directory) => Update(current => current with { Project = project, Directory = directory });
     public void SetSelection(string? sessionId, string agent) => Update(current => current with { SessionId = sessionId, Agent = agent });
     public void SetModel(string value) => Update(current => current with { Model = value });
     public void SetTask(CurrentTaskStatus task) => Update(current => current with { Task = task, Attention = task.IsActive ? current.Attention : null });

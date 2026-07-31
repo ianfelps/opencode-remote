@@ -27,6 +27,7 @@ public sealed class OpenCodeOptions
 
 public sealed class ProjectOptions
 {
+    public string? Id { get; init; }
     public required string Alias { get; init; }
     public required string Path { get; init; }
 }

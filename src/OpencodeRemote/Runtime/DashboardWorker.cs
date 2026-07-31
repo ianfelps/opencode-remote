@@ -46,8 +46,8 @@ internal sealed class DashboardWorker(
     {
         var width = Math.Min(100, Math.Max(36, AnsiConsole.Profile.Width - 6));
         var context = CreateTable();
-        Add(context, "project", runOptions.ProjectAlias);
-        Add(context, "directory", runOptions.ProjectPath);
+        Add(context, "project", snapshot.Project ?? runOptions.ProjectAlias);
+        Add(context, "directory", snapshot.Directory ?? runOptions.ProjectPath);
         Add(context, "session", snapshot.SessionId ?? "nenhuma selecionada");
         Add(context, "agent", snapshot.Agent);
         Add(context, "model", snapshot.Model);

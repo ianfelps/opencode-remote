@@ -8,6 +8,25 @@ namespace OpencodeRemote.Tests.OpenCode;
 public sealed class OpenCodeClientTests
 {
     [Fact]
+    public async Task ListProjectsReturnsKnownWorktrees()
+    {
+        HttpRequestMessage? captured = null;
+        using var client = CreateClient(request =>
+        {
+            captured = request;
+            return StubHttpMessageHandler.Json("""
+                [{"id":"project-1","worktree":"C:\\work","vcsDir":"C:\\work\\.git","time":{"created":1}}]
+                """);
+        });
+
+        var projects = await client.ListProjectsAsync(CancellationToken.None);
+
+        var project = Assert.Single(projects);
+        Assert.Equal(new OpenCodeProject("project-1", @"C:\work", @"C:\work\.git"), project);
+        Assert.Equal("http://127.0.0.1:4096/project", captured!.RequestUri!.AbsoluteUri);
+    }
+
+    [Fact]
     public async Task ListSessionsSendsAuthenticationAndDirectory()
     {
         HttpRequestMessage? captured = null;
@@ -149,6 +168,34 @@ public sealed class OpenCodeClientTests
         var result = await client.GetLatestAssistantTextAsync(@"C:\work", "session-1", CancellationToken.None);
 
         Assert.Equal("first\nsecond", result);
+    }
+
+    [Fact]
+    public async Task LatestAssistantOutcomeIncludesProviderError()
+    {
+        using var client = CreateClient(_ => StubHttpMessageHandler.Json("""
+            [{
+              "info": {
+                "id": "msg-error",
+                "role": "assistant",
+                "error": {
+                  "name": "APIError",
+                  "data": {
+                    "message": "Quota exceeded. Check your plan and billing details.",
+                    "statusCode": 429
+                  }
+                }
+              },
+              "parts": []
+            }]
+            """));
+
+        var result = await client.GetLatestAssistantOutcomeAsync(@"C:\work", "session-1", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal("msg-error", result.MessageId);
+        Assert.True(result.IsError);
+        Assert.Equal("Quota exceeded. Check your plan and billing details.", result.ErrorMessage);
     }
 
     [Fact]

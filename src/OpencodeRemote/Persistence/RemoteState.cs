@@ -8,4 +8,6 @@ public sealed record RemoteState(
     string? SessionId = null,
     string Agent = "build",
     IReadOnlyList<SessionModelSelection>? ModelSelections = null,
-    int? TelegramHistoryStartMessageId = null);
+    int? TelegramHistoryStartMessageId = null,
+    string? ProjectId = null,
+    string? ProjectDirectory = null);

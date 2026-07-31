@@ -28,6 +28,7 @@ public sealed class TelegramInteractionHandler(
         Selecione uma sessão antes de enviar mensagens.
 
         **Sessão**
+        - `/move` - seleciona outro projeto conhecido pelo OpenCode
         - `/session` - seleciona uma sessão existente e limpa o chat
         - `/sessions` - alias de `/session`
         - `/new` - cria uma sessão, ativa Build e limpa o chat
@@ -94,7 +95,9 @@ public sealed class TelegramInteractionHandler(
         await gate.WaitAsync(cancellationToken);
         try
         {
-            if (await questions.TryHandleFreeTextAsync(message.Chat.Id, text, cancellationToken))
+            var firstSegment = text.Trim().Split(' ', 2, StringSplitOptions.TrimEntries)[0];
+            if (!string.Equals(firstSegment, "/move", StringComparison.OrdinalIgnoreCase)
+                && await questions.TryHandleFreeTextAsync(message.Chat.Id, text, cancellationToken))
             {
                 return;
             }
@@ -193,6 +196,11 @@ public sealed class TelegramInteractionHandler(
                 await SendSessionsAsync(chatId, cancellationToken);
                 await ClearChatAsync(chatId, messageId, cancellationToken);
                 break;
+            case "/move":
+                await EnsureSessionIsIdleAsync(cancellationToken);
+                await SendProjectsAsync(chatId, cancellationToken);
+                await ClearChatAsync(chatId, messageId, cancellationToken);
+                break;
             case "/new":
                 await EnsureSessionIsIdleAsync(cancellationToken);
                 var restoreQuestion = questions.SuspendPending(chatId);
@@ -260,6 +268,38 @@ public sealed class TelegramInteractionHandler(
                     cancellationToken);
                 break;
         }
+    }
+
+    private async Task SendProjectsAsync(long chatId, CancellationToken cancellationToken)
+    {
+        if (delivery.Bot is null)
+        {
+            return;
+        }
+
+        var projects = await coordinator.ListProjectsAsync(cancellationToken);
+        if (projects.Count == 0)
+        {
+            await delivery.SendTextAsync(
+                chatId,
+                "## Nenhum projeto encontrado\n\nO OpenCode ainda não conhece outros projetos.",
+                cancellationToken);
+            return;
+        }
+
+        var callbackGroup = delivery.CreateCallbackGroup();
+        var keyboard = new InlineKeyboardMarkup(projects.Select(project => new[]
+        {
+            delivery.Button(
+                TelegramDelivery.TrimButtonText($"{project.Alias} | {project.Path}"),
+                new CallbackAction("project", project.Path, Value: project.Id, RequestId: project.Alias),
+                callbackGroup),
+        }));
+        await delivery.SendKeyboardAsync(
+            chatId,
+            "## Mover para outro projeto\n\nEscolha o novo contexto da conversa:",
+            keyboard,
+            cancellationToken);
     }
 
     private async Task SendSessionsAsync(long chatId, CancellationToken cancellationToken)
@@ -412,12 +452,31 @@ public sealed class TelegramInteractionHandler(
             string? confirmation = null;
             switch (action.Kind)
             {
+                case "project":
+                    var restoreProjectQuestion = questions.SuspendPending(callbackMessage.Chat.Id);
+                    RemoteState movedState;
+                    try
+                    {
+                        movedState = await coordinator.MoveProjectAsync(action.Value!, action.Directory, cancellationToken);
+                    }
+                    catch
+                    {
+                        restoreProjectQuestion?.Invoke();
+                        throw;
+                    }
+                    committed = true;
+                    await delivery.SendTextAsync(
+                        callbackMessage.Chat.Id,
+                        $"## Projeto alterado\n\n**Projeto:** `{movedState.ProjectAlias}`\n**Diretório:** `{movedState.ProjectDirectory}`\n\nSelecione uma sessão para continuar.",
+                        cancellationToken);
+                    await SendSessionsAsync(callbackMessage.Chat.Id, cancellationToken);
+                    break;
                 case "session":
                     var restoreSessionQuestion = questions.SuspendPending(callbackMessage.Chat.Id);
                     string selectedAgent;
                     try
                     {
-                        selectedAgent = await coordinator.SelectSessionAsync(action.SessionId!, cancellationToken);
+                        selectedAgent = await coordinator.SelectSessionAsync(action.Directory, action.SessionId!, cancellationToken);
                     }
                     catch
                     {
@@ -453,6 +512,7 @@ public sealed class TelegramInteractionHandler(
                     confirmation = "## Modelo automático\n\nO OpenCode voltará a escolher o modelo para os próximos prompts desta sessão.";
                     break;
                 case "implement-plan":
+                    await coordinator.EnsureCurrentContextAsync(action.Directory, action.SessionId, cancellationToken);
                     var currentState = await stateStore.GetAsync(cancellationToken);
                     if (currentState.SessionId != action.SessionId)
                     {
@@ -468,6 +528,7 @@ public sealed class TelegramInteractionHandler(
                     break;
                 case "permission":
                 case "permission-v2":
+                    await coordinator.EnsureCurrentContextAsync(action.Directory, action.SessionId, cancellationToken);
                     await RunWithProgressAsync(
                         callbackMessage.Chat.Id,
                         "## Processando autorização\n\nO OpenCode está retomando a tarefa.",
@@ -490,6 +551,7 @@ public sealed class TelegramInteractionHandler(
                     break;
                 case "question":
                 case "question-v2":
+                    await coordinator.EnsureCurrentContextAsync(action.Directory, action.SessionId, cancellationToken);
                     await questions.HandleSelectionAsync(callbackMessage.Chat.Id, action, cancellationToken);
                     committed = true;
                     break;

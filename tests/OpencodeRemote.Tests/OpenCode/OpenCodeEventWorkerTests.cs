@@ -11,7 +11,47 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"opencode-event-{Guid.NewGuid():N}");
 
     [Fact]
-    public async Task SessionErrorClearsLocalBusyStateBeforeNotification()
+    public async Task EventFromPreviousProjectIsIgnored()
+    {
+        Directory.CreateDirectory(_directory);
+        var options = Options.Create(new RemoteOptions
+        {
+            Telegram = new TelegramOptions { Token = "token", AllowedUserId = 1 },
+            Projects = [new ProjectOptions { Alias = "main", Path = _directory }],
+            StateFile = Path.Combine(_directory, "state.json"),
+        });
+        var store = new StateStore(options);
+        await store.SaveAsync(
+            new RemoteState(42, "main", "session-1", ProjectDirectory: _directory),
+            CancellationToken.None);
+        using var client = new OpenCodeClient(
+            options,
+            new StubHttpMessageHandler(_ => throw new InvalidOperationException("HTTP should not be called.")));
+        var notifier = new RecordingNotifier();
+        var worker = new OpenCodeEventWorker(
+            client,
+            store,
+            new SessionCoordinator(options, store, client),
+            notifier,
+            options,
+            NullLogger<OpenCodeEventWorker>.Instance);
+        using var document = JsonDocument.Parse("""
+            {
+              "directory": "C:\\another-project",
+              "payload": {
+                "type": "session.idle",
+                "properties": { "sessionID": "session-1" }
+              }
+            }
+            """);
+
+        await worker.HandleEventAsync(document.RootElement, CancellationToken.None);
+
+        Assert.Empty(notifier.Messages);
+    }
+
+    [Fact]
+    public async Task SessionErrorWhileBusyIsDeliveredWhenSessionBecomesIdle()
     {
         Directory.CreateDirectory(_directory);
         var options = Options.Create(new RemoteOptions
@@ -22,11 +62,22 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
         });
         var store = new StateStore(options);
         await store.SaveAsync(new RemoteState(42, "main", "session-1"), CancellationToken.None);
+        var statusRequests = 0;
+        var messageRequests = 0;
         using var client = new OpenCodeClient(options, new StubHttpMessageHandler(request =>
             request.RequestUri!.AbsolutePath switch
             {
+                "/session/status" when Interlocked.Increment(ref statusRequests) == 1
+                    => StubHttpMessageHandler.Json("{}"),
+                "/session/status" when statusRequests == 2
+                    => StubHttpMessageHandler.Json("{\"session-1\":{\"type\":\"busy\"}}"),
                 "/session/status" => StubHttpMessageHandler.Json("{}"),
                 "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
+                "/session/session-1/message" when Interlocked.Increment(ref messageRequests) == 1
+                    => StubHttpMessageHandler.Json("[]"),
+                "/session/session-1/message" => StubHttpMessageHandler.Json("""
+                    [{"info":{"id":"msg-error","role":"assistant","error":{"name":"APIError","data":{"message":"Quota exceeded. Check your plan and billing details.","statusCode":429}}},"parts":[]}]
+                    """),
                 _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
             }));
         var coordinator = new SessionCoordinator(options, store, client);
@@ -44,15 +95,251 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
               "directory": "C:\\project",
               "payload": {
                 "type": "session.error",
-                "properties": { "sessionID": "session-1" }
+                "properties": {
+                  "sessionID": "session-1",
+                  "error": {
+                    "name": "APIError",
+                    "data": {
+                      "message": "Quota exceeded. Check your plan and billing details.",
+                      "statusCode": 429
+                    }
+                  }
+                }
               }
             }
             """);
 
         await worker.HandleEventAsync(document.RootElement, CancellationToken.None);
 
-        Assert.False(await coordinator.IsBusyAsync(CancellationToken.None));
-        Assert.Single(notifier.Messages);
+        Assert.True(coordinator.IsLocallyActive("session-1"));
+        Assert.Empty(notifier.Messages);
+
+        using var idle = JsonDocument.Parse("""
+            {
+              "directory": "C:\\project",
+              "payload": {
+                "type": "session.idle",
+                "properties": { "sessionID": "session-1" }
+              }
+            }
+            """);
+        await worker.HandleEventAsync(idle.RootElement, CancellationToken.None);
+
+        Assert.False(coordinator.IsLocallyActive("session-1"));
+        Assert.Contains("Quota exceeded", Assert.Single(notifier.Messages), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SessionErrorUsesPayloadWhenAssistantMessageIsStillBaseline()
+    {
+        Directory.CreateDirectory(_directory);
+        var options = Options.Create(new RemoteOptions
+        {
+            Telegram = new TelegramOptions { Token = "token", AllowedUserId = 1 },
+            Projects = [new ProjectOptions { Alias = "main", Path = _directory }],
+            StateFile = Path.Combine(_directory, "state.json"),
+        });
+        var store = new StateStore(options);
+        await store.SaveAsync(new RemoteState(42, "main", "session-1"), CancellationToken.None);
+        using var client = new OpenCodeClient(options, new StubHttpMessageHandler(request =>
+            request.RequestUri!.AbsolutePath switch
+            {
+                "/session/status" => StubHttpMessageHandler.Json("{}"),
+                "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
+                "/session/session-1/message" => StubHttpMessageHandler.Json("""
+                    [{"info":{"id":"msg-old","role":"assistant"},"parts":[{"type":"text","text":"old"}]}]
+                    """),
+                _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
+            }));
+        var coordinator = new SessionCoordinator(options, store, client);
+        await coordinator.SendPromptAsync("work", CancellationToken.None);
+        var notifier = new RecordingNotifier();
+        var worker = new OpenCodeEventWorker(
+            client,
+            store,
+            coordinator,
+            notifier,
+            options,
+            NullLogger<OpenCodeEventWorker>.Instance);
+        using var document = JsonDocument.Parse("""
+            {
+              "directory": "C:\\project",
+              "payload": {
+                "type": "session.error",
+                "properties": {
+                  "sessionID": "session-1",
+                  "error": {"name":"APIError","data":{"message":"Quota exceeded."}}
+                }
+              }
+            }
+            """);
+
+        await worker.HandleEventAsync(document.RootElement, CancellationToken.None);
+
+        Assert.Contains("Quota exceeded", Assert.Single(notifier.Messages), StringComparison.Ordinal);
+        Assert.False(coordinator.IsLocallyActive("session-1"));
+    }
+
+    [Fact]
+    public async Task MessageUpdatedErrorAndFollowingIdleSendOneNotification()
+    {
+        Directory.CreateDirectory(_directory);
+        var options = Options.Create(new RemoteOptions
+        {
+            Telegram = new TelegramOptions { Token = "token", AllowedUserId = 1 },
+            Projects = [new ProjectOptions { Alias = "main", Path = _directory }],
+            StateFile = Path.Combine(_directory, "state.json"),
+        });
+        var store = new StateStore(options);
+        await store.SaveAsync(new RemoteState(42, "main", "session-1"), CancellationToken.None);
+        using var client = new OpenCodeClient(options, new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json("""
+            [{"info":{"id":"msg-error","role":"assistant","error":{"name":"APIError","data":{"message":"Quota exceeded."}}},"parts":[]}]
+            """)));
+        var notifier = new RecordingNotifier();
+        var worker = new OpenCodeEventWorker(
+            client,
+            store,
+            new SessionCoordinator(options, store, client),
+            notifier,
+            options,
+            NullLogger<OpenCodeEventWorker>.Instance);
+        using var updated = JsonDocument.Parse("""
+            {
+              "directory": "C:\\project",
+              "payload": {
+                "type": "message.updated",
+                "properties": {
+                  "info": {
+                    "id": "msg-error",
+                    "sessionID": "session-1",
+                    "role": "assistant",
+                    "error": {"name":"APIError","data":{"message":"Quota exceeded."}}
+                  }
+                }
+              }
+            }
+            """);
+        using var idle = JsonDocument.Parse("""
+            {
+              "directory": "C:\\project",
+              "payload": {
+                "type": "session.idle",
+                "properties": { "sessionID": "session-1" }
+              }
+            }
+            """);
+
+        await worker.HandleEventAsync(updated.RootElement, CancellationToken.None);
+        await worker.HandleEventAsync(idle.RootElement, CancellationToken.None);
+
+        Assert.Contains("Quota exceeded", Assert.Single(notifier.Messages), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReconciliationRecoversLostIdleAndRetriesFailedDelivery()
+    {
+        Directory.CreateDirectory(_directory);
+        var options = Options.Create(new RemoteOptions
+        {
+            Telegram = new TelegramOptions { Token = "token", AllowedUserId = 1 },
+            Projects = [new ProjectOptions { Alias = "main", Path = _directory }],
+            StateFile = Path.Combine(_directory, "state.json"),
+        });
+        var store = new StateStore(options);
+        await store.SaveAsync(new RemoteState(42, "main", "session-1"), CancellationToken.None);
+        var messageRequests = 0;
+        using var client = new OpenCodeClient(options, new StubHttpMessageHandler(request =>
+            request.RequestUri!.AbsolutePath switch
+            {
+                "/session/status" => StubHttpMessageHandler.Json("{}"),
+                "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
+                "/session/session-1/message" when Interlocked.Increment(ref messageRequests) <= 2
+                    => StubHttpMessageHandler.Json("""
+                        [{"info":{"id":"msg-old","role":"assistant"},"parts":[{"type":"text","text":"old"}]}]
+                        """),
+                "/session/session-1/message" => StubHttpMessageHandler.Json("""
+                    [{"info":{"id":"msg-finished","role":"assistant"},"parts":[{"type":"text","text":"finished"}]}]
+                    """),
+                _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
+            }));
+        var coordinator = new SessionCoordinator(options, store, client);
+        await coordinator.SendPromptAsync("work", CancellationToken.None);
+        var notifier = new RecordingNotifier { FailSendAttempts = 1 };
+        var worker = new OpenCodeEventWorker(
+            client,
+            store,
+            coordinator,
+            notifier,
+            options,
+            NullLogger<OpenCodeEventWorker>.Instance);
+        await Task.Delay(TimeSpan.FromSeconds(5.1));
+
+        await worker.ReconcilePendingAsync(CancellationToken.None);
+        Assert.Empty(notifier.Messages);
+        Assert.True(coordinator.IsLocallyActive("session-1"));
+
+        await Assert.ThrowsAsync<HttpRequestException>(() => worker.ReconcilePendingAsync(CancellationToken.None));
+        Assert.True(coordinator.IsLocallyActive("session-1"));
+
+        await worker.ReconcilePendingAsync(CancellationToken.None);
+
+        Assert.Equal(["finished"], notifier.Messages);
+        Assert.False(coordinator.IsLocallyActive("session-1"));
+    }
+
+    [Fact]
+    public async Task PlanButtonRetryDoesNotResendResponseText()
+    {
+        Directory.CreateDirectory(_directory);
+        var options = Options.Create(new RemoteOptions
+        {
+            Telegram = new TelegramOptions { Token = "token", AllowedUserId = 1 },
+            Projects = [new ProjectOptions { Alias = "main", Path = _directory }],
+            StateFile = Path.Combine(_directory, "state.json"),
+        });
+        var store = new StateStore(options);
+        await store.SaveAsync(new RemoteState(42, "main", "session-1", "plan"), CancellationToken.None);
+        var messageRequests = 0;
+        using var client = new OpenCodeClient(options, new StubHttpMessageHandler(request =>
+            request.RequestUri!.AbsolutePath switch
+            {
+                "/session/status" => StubHttpMessageHandler.Json("{}"),
+                "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
+                "/session/session-1/message" when Interlocked.Increment(ref messageRequests) == 1
+                    => StubHttpMessageHandler.Json("[]"),
+                "/session/session-1/message" => StubHttpMessageHandler.Json("""
+                    [{"info":{"id":"msg-plan","role":"assistant"},"parts":[{"type":"text","text":"plan ready"}]}]
+                    """),
+                _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
+            }));
+        var coordinator = new SessionCoordinator(options, store, client);
+        await coordinator.SendPromptAsync("plan", CancellationToken.None);
+        var notifier = new RecordingNotifier { FailPlanReadyAttempts = 1 };
+        var worker = new OpenCodeEventWorker(
+            client,
+            store,
+            coordinator,
+            notifier,
+            options,
+            NullLogger<OpenCodeEventWorker>.Instance);
+        using var idle = JsonDocument.Parse("""
+            {
+              "directory": "C:\\project",
+              "payload": {
+                "type": "session.idle",
+                "properties": { "sessionID": "session-1" }
+              }
+            }
+            """);
+
+        await Assert.ThrowsAsync<HttpRequestException>(() => worker.HandleEventAsync(idle.RootElement, CancellationToken.None));
+        Assert.True(coordinator.IsLocallyActive("session-1"));
+
+        await worker.HandleEventAsync(idle.RootElement, CancellationToken.None);
+
+        Assert.Equal(["plan ready"], notifier.Messages);
+        Assert.Equal(2, notifier.PlanReadyAttempts);
+        Assert.False(coordinator.IsLocallyActive("session-1"));
     }
 
     [Fact]
@@ -112,6 +399,7 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
                 "/session/status" when Interlocked.Increment(ref statusRequests) == 1
                     => StubHttpMessageHandler.Json("{}"),
                 "/session/status" => StubHttpMessageHandler.Json("{\"session-1\":{\"type\":\"busy\"}}"),
+                "/session/session-1/message" => StubHttpMessageHandler.Json("[]"),
                 "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
                 _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
             }));
@@ -157,6 +445,7 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
             request.RequestUri!.AbsolutePath switch
             {
                 "/session/status" => StubHttpMessageHandler.Json("{}"),
+                "/session/session-1/message" => StubHttpMessageHandler.Json("[]"),
                 "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
                 _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
             }));
@@ -204,6 +493,7 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
             request.RequestUri!.AbsolutePath switch
             {
                 "/session/status" => StubHttpMessageHandler.Json("{}"),
+                "/session/session-1/message" => StubHttpMessageHandler.Json("[]"),
                 "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
                 _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
             }));
@@ -305,9 +595,17 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
         public List<string> Messages { get; } = [];
         public List<string> ProgressMessages { get; } = [];
         public bool FailProgressCleanup { get; init; }
+        public int FailSendAttempts { get; set; }
+        public int FailPlanReadyAttempts { get; set; }
+        public int PlanReadyAttempts { get; private set; }
 
         public Task SendTextAsync(long chatId, string text, CancellationToken cancellationToken)
         {
+            if (FailSendAttempts > 0)
+            {
+                FailSendAttempts--;
+                return Task.FromException(new HttpRequestException("Telegram unavailable"));
+            }
             Messages.Add(text);
             return Task.CompletedTask;
         }
@@ -344,6 +642,15 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
             long chatId,
             string directory,
             string sessionId,
-            CancellationToken cancellationToken) => Task.CompletedTask;
+            CancellationToken cancellationToken)
+        {
+            PlanReadyAttempts++;
+            if (FailPlanReadyAttempts > 0)
+            {
+                FailPlanReadyAttempts--;
+                return Task.FromException(new HttpRequestException("Telegram unavailable"));
+            }
+            return Task.CompletedTask;
+        }
     }
 }

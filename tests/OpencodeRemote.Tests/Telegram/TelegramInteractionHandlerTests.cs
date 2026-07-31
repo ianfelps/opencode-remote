@@ -7,6 +7,7 @@ public sealed class TelegramInteractionHandlerTests
     [InlineData("/help")]
     [InlineData("/session")]
     [InlineData("/sessions")]
+    [InlineData("/move")]
     [InlineData("/new")]
     [InlineData("/plan [mensagem]")]
     [InlineData("/build [mensagem]")]

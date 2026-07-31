@@ -2,6 +2,11 @@ using System.Text.Json.Serialization;
 
 namespace OpencodeRemote.OpenCode.Models;
 
+public sealed record OpenCodeProject(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("worktree")] string Worktree,
+    [property: JsonPropertyName("vcsDir")] string? VcsDirectory = null);
+
 public sealed record OpenCodeSession(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("title")] string Title,
@@ -13,6 +18,11 @@ public sealed record SessionTime(
     [property: JsonPropertyName("updated")] long Updated);
 
 public sealed record ConversationMessage(string Role, string Text);
+
+public sealed record AssistantOutcome(string? MessageId, string Text, string? ErrorMessage)
+{
+    public bool IsError => !string.IsNullOrWhiteSpace(ErrorMessage);
+}
 
 public sealed record OpenCodeModelRef(
     [property: JsonPropertyName("providerID")] string ProviderId,

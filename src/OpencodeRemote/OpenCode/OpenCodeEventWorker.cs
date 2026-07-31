@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using OpencodeRemote.Configuration;
+using OpencodeRemote.OpenCode.Models;
 using OpencodeRemote.Persistence;
 using OpencodeRemote.Runtime;
 using OpencodeRemote.Sessions;
@@ -20,8 +21,13 @@ public sealed class OpenCodeEventWorker(
     RuntimeStatusStore? runtime = null,
     ApplicationExitState? exitState = null) : BackgroundService
 {
-    private readonly Dictionary<string, string> _lastResponses = [];
+    private sealed record DeliveredOutcome(string? MessageId, string Signature);
+    private sealed record PendingPlanReady(string Signature, Guid? Generation);
+
+    private readonly Dictionary<string, DeliveredOutcome> _deliveredOutcomes = [];
+    private readonly Dictionary<string, PendingPlanReady> _pendingPlanReady = [];
     private readonly HashSet<string> _reportedToolStates = [];
+    private readonly SemaphoreSlim _terminalGate = new(1, 1);
     private readonly TelegramOptions _telegram = options.Value.Telegram;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -47,6 +53,13 @@ public sealed class OpenCodeEventWorker(
             return;
         }
 
+        await Task.WhenAll(
+            RunEventStreamAsync(stoppingToken),
+            RunReconciliationLoopAsync(stoppingToken));
+    }
+
+    private async Task RunEventStreamAsync(CancellationToken stoppingToken)
+    {
         while (!stoppingToken.IsCancellationRequested && !await client.IsHealthyAsync(stoppingToken))
         {
             runtime?.SetEvents("aguardando OpenCode");
@@ -115,6 +128,11 @@ public sealed class OpenCodeEventWorker(
         {
             return;
         }
+        if (state.ProjectDirectory is not null
+            && !SessionCoordinator.PathsEqual(state.ProjectDirectory, directory))
+        {
+            return;
+        }
 
         switch (type)
         {
@@ -122,31 +140,7 @@ public sealed class OpenCodeEventWorker(
                 await HandleIdleAsync(directory, properties, state, cancellationToken);
                 break;
             case "session.error":
-                var failedSessionId = GetString(properties, "sessionID");
-                if (failedSessionId != state.SessionId)
-                {
-                    break;
-                }
-                if (failedSessionId is not null
-                    && await IsStaleTerminalEventAsync(directory, failedSessionId, cancellationToken))
-                {
-                    break;
-                }
-                if (failedSessionId is not null && failedSessionId == state.SessionId)
-                {
-                    runtime?.SetAttention(null);
-                    runtime?.SetError("O OpenCode interrompeu a execução.");
-                    ClearSessionProgress(failedSessionId);
-                }
-                if (failedSessionId == state.SessionId)
-                {
-                    await notifier.StopTypingAsync(state.ChatId);
-                    await ClearProgressBestEffortAsync(state.ChatId, cancellationToken);
-                    await notifier.SendTextAsync(
-                        state.ChatId,
-                        "## Erro na execução\n\nO OpenCode encontrou um erro e interrompeu o processamento.",
-                        cancellationToken);
-                }
+                await HandleSessionErrorAsync(directory, properties, state, cancellationToken);
                 break;
             case "permission.updated":
             case "permission.asked":
@@ -164,6 +158,9 @@ public sealed class OpenCodeEventWorker(
             case "message.part.updated":
                 await HandlePartUpdatedAsync(properties, state, cancellationToken);
                 break;
+            case "message.updated":
+                await HandleMessageUpdatedAsync(directory, properties, state, cancellationToken);
+                break;
             case "todo.updated":
                 await HandleTodoUpdatedAsync(properties, state, cancellationToken);
                 break;
@@ -180,28 +177,227 @@ public sealed class OpenCodeEventWorker(
         {
             return;
         }
+        var generation = coordinator.GetActiveGeneration(sessionId);
 
         if (await IsStaleTerminalEventAsync(directory, sessionId, cancellationToken))
         {
             return;
         }
-        runtime?.SetAttention(null);
-        ClearSessionProgress(sessionId);
 
-        await notifier.StopTypingAsync(state.ChatId);
-        await ClearProgressBestEffortAsync(state.ChatId, cancellationToken);
-        var text = await client.GetLatestAssistantTextAsync(directory, sessionId, cancellationToken);
-        if (string.IsNullOrWhiteSpace(text)
-            || (_lastResponses.TryGetValue(sessionId, out var previous) && previous == text))
+        var outcome = await client.GetLatestAssistantOutcomeAsync(directory, sessionId, cancellationToken);
+        if (outcome is null)
+        {
+            return;
+        }
+        if (IsBaselineOutcome(sessionId, outcome))
         {
             return;
         }
 
-        await notifier.SendTextAsync(state.ChatId, text, cancellationToken);
-        _lastResponses[sessionId] = text;
-        if (string.Equals(state.Agent, "plan", StringComparison.OrdinalIgnoreCase))
+        await DeliverOutcomeAsync(directory, state, sessionId, outcome, generation, cancellationToken);
+    }
+
+    private async Task HandleSessionErrorAsync(
+        string directory,
+        JsonElement properties,
+        RemoteState state,
+        CancellationToken cancellationToken)
+    {
+        var sessionId = GetString(properties, "sessionID");
+        if (sessionId is null || sessionId != state.SessionId)
         {
-            await notifier.SendPlanReadyAsync(state.ChatId, directory, sessionId, cancellationToken);
+            return;
+        }
+        var generation = coordinator.GetActiveGeneration(sessionId);
+
+        var payloadError = properties.TryGetProperty("error", out var error)
+            ? OpenCodeClient.GetErrorMessage(error)
+            : null;
+        if (await IsStaleTerminalEventAsync(directory, sessionId, cancellationToken))
+        {
+            return;
+        }
+
+        AssistantOutcome? outcome = null;
+        try
+        {
+            outcome = await client.GetLatestAssistantOutcomeAsync(directory, sessionId, cancellationToken);
+        }
+        catch (HttpRequestException exception)
+        {
+            logger.LogDebug(exception, "Não foi possível consultar a mensagem associada ao erro da sessão");
+        }
+
+        if (outcome is not null && IsBaselineOutcome(sessionId, outcome))
+        {
+            outcome = null;
+        }
+
+        if (outcome?.IsError != true)
+        {
+            outcome = new AssistantOutcome(null, outcome?.Text ?? "", payloadError
+                ?? "O OpenCode encontrou um erro e interrompeu o processamento.");
+        }
+        await DeliverOutcomeAsync(directory, state, sessionId, outcome, generation, cancellationToken);
+    }
+
+    private async Task HandleMessageUpdatedAsync(
+        string directory,
+        JsonElement properties,
+        RemoteState state,
+        CancellationToken cancellationToken)
+    {
+        if (!properties.TryGetProperty("info", out var info)
+            || GetString(info, "role") != "assistant"
+            || GetString(info, "sessionID") is not { } sessionId
+            || sessionId != state.SessionId)
+        {
+            return;
+        }
+
+        var outcome = OpenCodeClient.ParseAssistantOutcome(info);
+        if (!outcome.IsError)
+        {
+            return;
+        }
+        var generation = coordinator.GetActiveGeneration(sessionId);
+        if (IsBaselineOutcome(sessionId, outcome))
+        {
+            return;
+        }
+        if (await IsStaleTerminalEventAsync(directory, sessionId, cancellationToken))
+        {
+            return;
+        }
+        await DeliverOutcomeAsync(directory, state, sessionId, outcome, generation, cancellationToken);
+    }
+
+    private async Task DeliverOutcomeAsync(
+        string directory,
+        RemoteState state,
+        string sessionId,
+        AssistantOutcome outcome,
+        Guid? generation,
+        CancellationToken cancellationToken)
+    {
+        var text = outcome.IsError
+            ? $"## Erro na execução\n\n{outcome.ErrorMessage}"
+            : outcome.Text;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        var signature = outcome.IsError ? $"error:{outcome.ErrorMessage}" : $"text:{outcome.Text}";
+        await _terminalGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (coordinator.GetActiveGeneration(sessionId) != generation)
+            {
+                return;
+            }
+            if (_pendingPlanReady.TryGetValue(sessionId, out var stalePlan)
+                && (stalePlan.Generation != generation || stalePlan.Signature != signature))
+            {
+                _pendingPlanReady.Remove(sessionId);
+            }
+            if (_deliveredOutcomes.TryGetValue(sessionId, out var previous)
+                && (previous.MessageId is not null && previous.MessageId == outcome.MessageId
+                    || !coordinator.IsLocallyActive(sessionId) && previous.Signature == signature))
+            {
+                if (_pendingPlanReady.TryGetValue(sessionId, out var pendingPlan)
+                    && pendingPlan.Generation == generation && pendingPlan.Signature == signature)
+                {
+                    await notifier.SendPlanReadyAsync(state.ChatId, directory, sessionId, cancellationToken);
+                    _pendingPlanReady.Remove(sessionId);
+                    ClearSessionProgress(sessionId, generation);
+                }
+                return;
+            }
+
+            await StopTypingBestEffortAsync(state.ChatId);
+            await ClearProgressBestEffortAsync(state.ChatId, cancellationToken);
+            await notifier.SendTextAsync(state.ChatId, text, cancellationToken);
+
+            _deliveredOutcomes[sessionId] = new DeliveredOutcome(outcome.MessageId, signature);
+            runtime?.SetAttention(null);
+            if (outcome.IsError)
+            {
+                runtime?.SetError(outcome.ErrorMessage!);
+            }
+            if (!outcome.IsError && string.Equals(state.Agent, "plan", StringComparison.OrdinalIgnoreCase))
+            {
+                _pendingPlanReady[sessionId] = new PendingPlanReady(signature, generation);
+                await notifier.SendPlanReadyAsync(state.ChatId, directory, sessionId, cancellationToken);
+                _pendingPlanReady.Remove(sessionId);
+            }
+            ClearSessionProgress(sessionId, generation);
+        }
+        finally
+        {
+            _terminalGate.Release();
+        }
+    }
+
+    private async Task RunReconciliationLoopAsync(CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            try
+            {
+                await ReconcilePendingAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception exception)
+            {
+                runtime?.SetError(exception.Message);
+                logger.LogWarning(exception, "Falha ao reconciliar resposta pendente do OpenCode");
+            }
+        }
+    }
+
+    internal async Task ReconcilePendingAsync(CancellationToken cancellationToken)
+    {
+        var state = await stateStore.GetAsync(cancellationToken);
+        if (state.ChatId == 0 || state.SessionId is not { } sessionId || !coordinator.IsLocallyActive(sessionId)
+            || coordinator.IsPreparingPrompt(sessionId) || coordinator.IsWithinBusyGrace(sessionId))
+        {
+            return;
+        }
+        var generation = coordinator.GetActiveGeneration(sessionId);
+
+        var project = coordinator.ResolveProject(state);
+        if (project is null || await client.IsSessionBusyAsync(project.Path, sessionId, cancellationToken))
+        {
+            return;
+        }
+
+        var outcome = await client.GetLatestAssistantOutcomeAsync(project.Path, sessionId, cancellationToken);
+        if (outcome is not null
+            && (outcome.MessageId is null || outcome.MessageId != coordinator.GetBaselineAssistantMessageId(sessionId)))
+        {
+            await DeliverOutcomeAsync(project.Path, state, sessionId, outcome, generation, cancellationToken);
+        }
+    }
+
+    private bool IsBaselineOutcome(string sessionId, AssistantOutcome outcome)
+        => coordinator.IsLocallyActive(sessionId)
+            && outcome.MessageId is { } messageId
+            && messageId == coordinator.GetBaselineAssistantMessageId(sessionId);
+
+    private async Task StopTypingBestEffortAsync(long chatId)
+    {
+        try
+        {
+            await notifier.StopTypingAsync(chatId);
+        }
+        catch (Exception exception)
+        {
+            logger.LogDebug(exception, "Falha ao interromper indicador de digitação");
         }
     }
 
@@ -349,9 +545,12 @@ public sealed class OpenCodeEventWorker(
         }
     }
 
-    private void ClearSessionProgress(string sessionId)
+    private void ClearSessionProgress(string sessionId, Guid? generation)
     {
-        coordinator.MarkIdle(sessionId);
+        if (generation is { } activeGeneration)
+        {
+            coordinator.MarkIdle(sessionId, activeGeneration);
+        }
         _reportedToolStates.RemoveWhere(key => key.StartsWith(sessionId + ':', StringComparison.Ordinal));
     }
 

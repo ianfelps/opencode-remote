@@ -20,7 +20,9 @@ public sealed class SessionCoordinatorTests : IDisposable
 
         var state = await coordinator.ActivateProjectAsync("main", CancellationToken.None);
 
-        Assert.Equal(new RemoteState(1, "Main", null), state);
+        Assert.Equal("Main", state.ProjectAlias);
+        Assert.Null(state.SessionId);
+        Assert.Equal(Path.GetFullPath(_directory), state.ProjectDirectory);
         Assert.Equal(state, await new StateStore(options).GetAsync(CancellationToken.None));
     }
 
@@ -132,6 +134,10 @@ public sealed class SessionCoordinatorTests : IDisposable
             {
                 return StubHttpMessageHandler.Json("{}");
             }
+            if (request.RequestUri.AbsolutePath == "/session/session-1/message")
+            {
+                return StubHttpMessageHandler.Json("[]");
+            }
 
             promptBody = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
             return new HttpResponseMessage(HttpStatusCode.NoContent);
@@ -157,6 +163,7 @@ public sealed class SessionCoordinatorTests : IDisposable
         using var client = CreateClient(options, request => request.RequestUri!.AbsolutePath switch
         {
             "/session/status" => StubHttpMessageHandler.Json("{}"),
+            "/session/session-1/message" => StubHttpMessageHandler.Json("[]"),
             "/config/providers" => StubHttpMessageHandler.Json(ProviderResponse()),
             "/session/session-1/prompt_async" => CapturePrompt(request, value => promptBody = value),
             _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
@@ -240,6 +247,7 @@ public sealed class SessionCoordinatorTests : IDisposable
         using var client = CreateClient(options, request => request.RequestUri!.AbsolutePath switch
         {
             "/session/status" => StubHttpMessageHandler.Json("{}"),
+            "/session/session-2/message" => StubHttpMessageHandler.Json("[]"),
             "/session/session-2/prompt_async" => CapturePrompt(request, value => promptBody = value),
             _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
         });
@@ -289,10 +297,60 @@ public sealed class SessionCoordinatorTests : IDisposable
         });
         var coordinator = new SessionCoordinator(options, store, client);
 
-        var agent = await coordinator.SelectSessionAsync(session.Id, CancellationToken.None);
+        var agent = await coordinator.SelectSessionAsync(project.Path, session.Id, CancellationToken.None);
 
         Assert.Equal("plan", agent);
         Assert.Equal("plan", (await store.GetAsync(CancellationToken.None)).Agent);
+    }
+
+    [Fact]
+    public async Task MoveProjectPersistsDiscoveredProjectAndClearsSession()
+    {
+        var firstDirectory = Path.Combine(_directory, "first");
+        var secondDirectory = Path.Combine(_directory, "second");
+        Directory.CreateDirectory(firstDirectory);
+        Directory.CreateDirectory(secondDirectory);
+        var options = CreateOptions(new ProjectOptions { Alias = "first", Path = firstDirectory });
+        var store = new StateStore(options);
+        await store.SaveAsync(new RemoteState(42, "first", "session-1", ProjectDirectory: firstDirectory), CancellationToken.None);
+        using var client = CreateClient(options, request => request.RequestUri!.AbsolutePath switch
+        {
+            "/project" => StubHttpMessageHandler.Json(JsonSerializer.Serialize(new[]
+            {
+                new { id = "project-2", worktree = secondDirectory, time = new { created = 1 } },
+            })),
+            "/session/status" => StubHttpMessageHandler.Json("{}"),
+            _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
+        });
+        var coordinator = new SessionCoordinator(options, store, client);
+
+        var state = await coordinator.MoveProjectAsync("project-2", secondDirectory, CancellationToken.None);
+
+        Assert.Equal("second", state.ProjectAlias);
+        Assert.Equal("project-2", state.ProjectId);
+        Assert.Equal(Path.GetFullPath(secondDirectory), state.ProjectDirectory);
+        Assert.Null(state.SessionId);
+        Assert.Equal("build", state.Agent);
+        Assert.Equal(state, await new StateStore(options).GetAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task SelectSessionRejectsCallbackFromPreviousProject()
+    {
+        Directory.CreateDirectory(_directory);
+        var project = new ProjectOptions { Alias = "main", Path = _directory };
+        var options = CreateOptions(project);
+        var store = new StateStore(options);
+        await store.SaveAsync(new RemoteState(42, project.Alias, ProjectDirectory: project.Path), CancellationToken.None);
+        using var client = CreateClient(options, _ => throw new InvalidOperationException("HTTP should not be called."));
+        var coordinator = new SessionCoordinator(options, store, client);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.SelectSessionAsync(
+            Path.Combine(_directory, "old"),
+            "session-1",
+            CancellationToken.None));
+
+        Assert.Contains("projeto selecionado mudou", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -306,6 +364,7 @@ public sealed class SessionCoordinatorTests : IDisposable
         using var client = CreateClient(options, request => request.RequestUri!.AbsolutePath switch
         {
             "/session/status" => StubHttpMessageHandler.Json("{}"),
+            "/session/session-1/message" => StubHttpMessageHandler.Json("[]"),
             "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
             _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
         });
