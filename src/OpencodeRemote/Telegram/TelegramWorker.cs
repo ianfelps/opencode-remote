@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using OpencodeRemote.Configuration;
+using OpencodeRemote.Runtime;
 using OpencodeRemote.Telegram.Models;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -14,23 +15,44 @@ public sealed class TelegramWorker(
     TelegramDelivery delivery,
     TelegramQuestionFlow questions,
     TelegramInteractionHandler interactions,
-    ILogger<TelegramWorker> logger) : BackgroundService, IRemoteNotifier
+    ILogger<TelegramWorker> logger,
+    RuntimeStatusStore? runtime = null,
+    ApplicationExitState? exitState = null) : BackgroundService, IRemoteNotifier
 {
     private readonly TelegramOptions _settings = options.Value.Telegram;
     private int _consecutivePollingErrors;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        try
+        {
+            await RunAsync(stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+            exitState?.Fail();
+            throw;
+        }
+    }
+
+    private async Task RunAsync(CancellationToken stoppingToken)
+    {
         delivery.SetStoppingToken(stoppingToken);
         if (delivery.Bot is null || _settings.AllowedUserId == 0)
         {
+            runtime?.SetTelegram("não configurado");
             logger.LogWarning("Telegram desativado. Configure Remote:Telegram:Token e AllowedUserId.");
             return;
         }
 
         var receiverOptions = new ReceiverOptions { AllowedUpdates = [UpdateType.Message, UpdateType.CallbackQuery] };
+        runtime?.SetTelegram("conectando");
         delivery.Bot.StartReceiving(HandleUpdateAsync, HandleErrorAsync, receiverOptions, stoppingToken);
         var me = await delivery.Bot.GetMe(stoppingToken);
+        runtime?.SetTelegram($"conectado como @{me.Username}");
         logger.LogInformation("Bot Telegram @{Username} iniciado", me.Username);
         await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
     }
@@ -87,6 +109,7 @@ public sealed class TelegramWorker(
         CancellationToken cancellationToken)
     {
         Interlocked.Exchange(ref _consecutivePollingErrors, 0);
+        runtime?.SetTelegram("conectado");
         return interactions.HandleUpdateAsync(update, cancellationToken);
     }
 
@@ -98,6 +121,8 @@ public sealed class TelegramWorker(
     {
         var attempt = Interlocked.Increment(ref _consecutivePollingErrors);
         var delay = TelegramRetryPolicy.GetDelay(attempt);
+        runtime?.SetTelegram($"reconectando em {delay.TotalSeconds:0}s");
+        runtime?.SetError(exception.Message);
         if (exception is ApiRequestException { ErrorCode: >= 500 } apiException)
         {
             logger.LogWarning(

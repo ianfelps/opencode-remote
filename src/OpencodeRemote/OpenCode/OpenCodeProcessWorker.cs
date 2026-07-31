@@ -2,35 +2,54 @@ using System.Diagnostics;
 using System.Text;
 using Microsoft.Extensions.Options;
 using OpencodeRemote.Configuration;
+using OpencodeRemote.Runtime;
 
 namespace OpencodeRemote.OpenCode;
 
 public sealed class OpenCodeProcessWorker(
     IOptions<RemoteOptions> options,
     OpenCodeClient client,
-    ILogger<OpenCodeProcessWorker> logger) : BackgroundService
+    ILogger<OpenCodeProcessWorker> logger,
+    RuntimeStatusStore? runtime = null,
+    ApplicationExitState? exitState = null) : BackgroundService
 {
-    private readonly TelegramOptions _telegram = options.Value.Telegram;
     private readonly OpenCodeOptions _settings = options.Value.OpenCode;
     private readonly StringBuilder _output = new();
     private Process? _process;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (string.IsNullOrWhiteSpace(_telegram.Token) || _telegram.AllowedUserId == 0)
+        try
         {
-            logger.LogWarning("OpenCode não será iniciado enquanto o Telegram não estiver configurado.");
-            return;
+            await RunAsync(stoppingToken);
         }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+            exitState?.Fail();
+            throw;
+        }
+    }
 
+    private async Task RunAsync(CancellationToken stoppingToken)
+    {
         if (_settings.ManageProcess && string.IsNullOrWhiteSpace(_settings.Password))
         {
             throw new InvalidOperationException("Configure uma senha para o servidor OpenCode antes de iniciá-lo.");
         }
 
-        if (await client.IsHealthyAsync(stoppingToken) || !_settings.ManageProcess)
+        runtime?.SetOpenCode("verificando servidor");
+        if (await client.IsHealthyAsync(stoppingToken))
         {
+            runtime?.SetOpenCode($"conectado em {_settings.BaseUrl}");
             return;
+        }
+        if (!_settings.ManageProcess)
+        {
+            runtime?.SetOpenCode("indisponível");
+            throw new InvalidOperationException($"OpenCode não está disponível em {_settings.BaseUrl}.");
         }
 
         var address = new Uri(_settings.BaseUrl);
@@ -38,6 +57,7 @@ public sealed class OpenCodeProcessWorker(
         startInfo.Environment["OPENCODE_SERVER_USERNAME"] = _settings.Username;
         startInfo.Environment["OPENCODE_SERVER_PASSWORD"] = _settings.Password;
         logger.LogInformation("Iniciando OpenCode em {BaseUrl}", _settings.BaseUrl);
+        runtime?.SetOpenCode("iniciando processo");
         _process = Process.Start(startInfo) ?? throw new InvalidOperationException("Não foi possível iniciar o OpenCode.");
         _process.OutputDataReceived += (_, eventArgs) => Log(eventArgs.Data);
         _process.ErrorDataReceived += (_, eventArgs) => Log(eventArgs.Data);
@@ -48,6 +68,7 @@ public sealed class OpenCodeProcessWorker(
         {
             if (_process.HasExited)
             {
+                runtime?.SetOpenCode("processo encerrado");
                 throw new InvalidOperationException(
                     $"O processo do OpenCode encerrou com código {_process.ExitCode}. {_output.ToString().Trim()}");
             }
@@ -55,12 +76,20 @@ public sealed class OpenCodeProcessWorker(
             if (await client.IsHealthyAsync(stoppingToken))
             {
                 logger.LogInformation("OpenCode disponível em {BaseUrl}", _settings.BaseUrl);
+                runtime?.SetOpenCode($"conectado em {_settings.BaseUrl}");
+                await _process.WaitForExitAsync(stoppingToken);
+                if (!stoppingToken.IsCancellationRequested)
+                {
+                    runtime?.SetOpenCode($"encerrado com código {_process.ExitCode}");
+                    throw new InvalidOperationException($"O processo do OpenCode encerrou com código {_process.ExitCode}.");
+                }
                 return;
             }
 
             await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
         }
 
+        runtime?.SetOpenCode("tempo limite ao iniciar");
         throw new InvalidOperationException("OpenCode não ficou disponível dentro do tempo esperado.");
     }
 

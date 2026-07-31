@@ -4,6 +4,7 @@ using OpencodeRemote.Configuration;
 using OpencodeRemote.OpenCode;
 using OpencodeRemote.OpenCode.Models;
 using OpencodeRemote.Persistence;
+using OpencodeRemote.Runtime;
 using OpencodeRemote.Sessions.Models;
 
 namespace OpencodeRemote.Sessions;
@@ -11,7 +12,8 @@ namespace OpencodeRemote.Sessions;
 public sealed class SessionCoordinator(
     IOptions<RemoteOptions> options,
     StateStore stateStore,
-    OpenCodeClient client)
+    OpenCodeClient client,
+    RuntimeStatusStore? runtime = null)
 {
     private sealed record ActiveSession(
         DateTimeOffset? StartedAt,
@@ -27,12 +29,10 @@ public sealed class SessionCoordinator(
     private readonly ConcurrentDictionary<string, ActiveSession> _activeSessions = new();
     private static readonly TimeSpan BusyPropagationGrace = TimeSpan.FromSeconds(5);
 
-    public IReadOnlyList<ProjectOptions> Projects => _options.Projects;
-
     public ProjectOptions? FindProject(string alias) =>
         _options.Projects.FirstOrDefault(project => string.Equals(project.Alias, alias, StringComparison.OrdinalIgnoreCase));
 
-    public async Task<RemoteState> SelectProjectAsync(long chatId, string alias, CancellationToken cancellationToken)
+    public async Task<RemoteState> ActivateProjectAsync(string alias, CancellationToken cancellationToken)
     {
         var project = FindProject(alias) ?? throw new InvalidOperationException("Projeto não autorizado.");
         if (!Directory.Exists(project.Path))
@@ -44,9 +44,31 @@ public sealed class SessionCoordinator(
         try
         {
             var current = await stateStore.GetAsync(cancellationToken);
-            var state = current with { ChatId = chatId, ProjectAlias = project.Alias, SessionId = null, Agent = "build" };
+            var state = string.Equals(current.ProjectAlias, project.Alias, StringComparison.OrdinalIgnoreCase)
+                ? current
+                : current with { ProjectAlias = project.Alias, SessionId = null, Agent = "build" };
             await stateStore.SaveAsync(state, cancellationToken);
+            runtime?.SetSelection(state.SessionId, state.Agent);
+            var model = FindModelSelection(state)?.Model;
+            runtime?.SetModel(model is null ? "automático" : $"{model.ProviderId}/{model.ModelId}");
             return state;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task SetChatIdAsync(long chatId, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var state = await stateStore.GetAsync(cancellationToken);
+            if (state.ChatId != chatId)
+            {
+                await stateStore.SaveAsync(state with { ChatId = chatId }, cancellationToken);
+            }
         }
         finally
         {
@@ -71,6 +93,7 @@ public sealed class SessionCoordinator(
             var (state, project) = await RequireProjectAsync(cancellationToken);
             var session = await client.CreateSessionAsync(project.Path, cancellationToken);
             await stateStore.SaveAsync(state with { SessionId = session.Id, Agent = "build" }, cancellationToken);
+            runtime?.SetSelection(session.Id, "build");
             return session;
         }
         finally
@@ -93,6 +116,7 @@ public sealed class SessionCoordinator(
 
             var agent = NormalizeAgent(await client.GetLatestUserAgentAsync(project.Path, sessionId, cancellationToken));
             await stateStore.SaveAsync(state with { SessionId = sessionId, Agent = agent }, cancellationToken);
+            runtime?.SetSelection(sessionId, agent);
             return agent;
         }
         finally
@@ -122,6 +146,7 @@ public sealed class SessionCoordinator(
 
             var active = new ActiveSession(DateTimeOffset.UtcNow, true);
             _activeSessions[state.SessionId] = active;
+            runtime?.SetTask(ToCurrentTaskStatus(active));
             try
             {
                 if (beforeSubmit is not null)
@@ -140,6 +165,7 @@ public sealed class SessionCoordinator(
             catch
             {
                 _activeSessions.TryRemove(state.SessionId, out _);
+                runtime?.SetTask(new CurrentTaskStatus(false));
                 throw;
             }
         }
@@ -149,21 +175,28 @@ public sealed class SessionCoordinator(
         }
     }
 
-    public void MarkIdle(string sessionId) => _activeSessions.TryRemove(sessionId, out _);
+    public void MarkIdle(string sessionId)
+    {
+        var wasActive = _activeSessions.TryRemove(sessionId, out _);
+        if (wasActive || runtime?.Get().SessionId == sessionId)
+        {
+            runtime?.SetTask(new CurrentTaskStatus(false));
+        }
+    }
 
     internal CurrentTaskStatus? UpdateTaskStep(string sessionId, string step)
-        => TryUpdateActiveSession(sessionId, active => active with { Step = step });
+        => UpdateRuntime(TryUpdateActiveSession(sessionId, active => active with { Step = step }));
 
     internal CurrentTaskStatus? UpdateTaskActivity(string sessionId, string activity)
-        => TryUpdateActiveSession(sessionId, active => active with { Activity = activity });
+        => UpdateRuntime(TryUpdateActiveSession(sessionId, active => active with { Activity = activity }));
 
     internal CurrentTaskStatus? UpdateTaskDiff(string sessionId, int files, int additions, int deletions)
-        => TryUpdateActiveSession(sessionId, active => active with
+        => UpdateRuntime(TryUpdateActiveSession(sessionId, active => active with
         {
             Files = files,
             Additions = additions,
             Deletions = deletions,
-        });
+        }));
 
     internal bool IsLocallyActive(string sessionId) => _activeSessions.ContainsKey(sessionId);
 
@@ -198,6 +231,7 @@ public sealed class SessionCoordinator(
             }
 
             await stateStore.SaveAsync(state with { Agent = agent }, cancellationToken);
+            runtime?.SetSelection(state.SessionId, agent);
         }
         finally
         {
@@ -233,7 +267,7 @@ public sealed class SessionCoordinator(
                     Path.GetFullPath(expectedDirectory),
                     StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidOperationException("O projeto ou a sessão selecionada mudou. Use /model novamente.");
+                throw new InvalidOperationException("A sessão selecionada mudou. Use /model novamente.");
             }
 
             if (await IsSessionBusyAsync(project.Path, state.SessionId, cancellationToken))
@@ -259,6 +293,7 @@ public sealed class SessionCoordinator(
             selections.Add(new SessionModelSelection(project.Alias, state.SessionId, model));
 
             await stateStore.SaveAsync(state with { ModelSelections = selections }, cancellationToken);
+            runtime?.SetModel(model is null ? "automático" : $"{model.ProviderId}/{model.ModelId}");
         }
         finally
         {
@@ -275,7 +310,9 @@ public sealed class SessionCoordinator(
         try
         {
             var state = await stateStore.GetAsync(cancellationToken);
-            return (state, await ResolveCurrentModelAsync(state, cancellationToken));
+            var model = await ResolveCurrentModelAsync(state, cancellationToken);
+            runtime?.SetModel(model.Model is null ? "automático" : $"{model.Model.ProviderId}/{model.Model.ModelId}");
+            return (state, model);
         }
         finally
         {
@@ -403,6 +440,19 @@ public sealed class SessionCoordinator(
             && !_activeSessions.TryUpdate(sessionId, active with { IsPreparing = false }, active))
         {
         }
+        if (_activeSessions.TryGetValue(sessionId, out var submitted))
+        {
+            runtime?.SetTask(ToCurrentTaskStatus(submitted));
+        }
+    }
+
+    private CurrentTaskStatus? UpdateRuntime(CurrentTaskStatus? status)
+    {
+        if (status is not null)
+        {
+            runtime?.SetTask(status);
+        }
+        return status;
     }
 
     private static CurrentTaskStatus ToCurrentTaskStatus(ActiveSession active)
@@ -436,7 +486,7 @@ public sealed class SessionCoordinator(
         var state = await stateStore.GetAsync(cancellationToken);
         var project = state.ProjectAlias is null ? null : FindProject(state.ProjectAlias);
         return project is null
-            ? throw new InvalidOperationException("Selecione um projeto com /projects.")
+            ? throw new InvalidOperationException("O projeto desta instância não está disponível.")
             : (state, project);
     }
 

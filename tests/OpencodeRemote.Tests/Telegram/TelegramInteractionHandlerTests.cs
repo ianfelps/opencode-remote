@@ -5,7 +5,6 @@ public sealed class TelegramInteractionHandlerTests
     [Theory]
     [InlineData("/start")]
     [InlineData("/help")]
-    [InlineData("/projects")]
     [InlineData("/session")]
     [InlineData("/sessions")]
     [InlineData("/new")]
@@ -28,11 +27,11 @@ public sealed class TelegramInteractionHandlerTests
         var html = TelegramTextFormatter.ToHtml(TelegramInteractionHandler.HelpText);
 
         Assert.Contains("<b>OpenCode Remote</b>", html, StringComparison.Ordinal);
-        Assert.Contains("<b>Projeto e sess&#227;o</b>", html, StringComparison.Ordinal);
+        Assert.Contains("<b>Sess&#227;o</b>", html, StringComparison.Ordinal);
         Assert.Contains("<b>Modos e prompts</b>", html, StringComparison.Ordinal);
         Assert.Contains("<b>Estado e controle</b>", html, StringComparison.Ordinal);
         Assert.Contains("<b>Ajuda</b>", html, StringComparison.Ordinal);
-        Assert.Contains("Selecione um projeto e uma sess&#227;o", html, StringComparison.Ordinal);
+        Assert.Contains("Selecione uma sess&#227;o", html, StringComparison.Ordinal);
         Assert.Contains("mensagem comum", html, StringComparison.Ordinal);
     }
 

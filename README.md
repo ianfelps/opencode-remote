@@ -1,10 +1,22 @@
 # OpenCode Remote
 
-Cliente remoto pessoal que conecta o Telegram a sessões locais do [OpenCode](https://opencode.ai/). O serviço roda no seu computador, usa long polling e mantém a API do OpenCode restrita à interface local, sem abrir portas no roteador.
+<div align="center">
+<pre>
+                                 ▄
+█▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█
+█  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀
+▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀  ▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
+              R E M O T E
+</pre>
+</div>
+
+CLI que conecta o Telegram a sessões locais do [OpenCode](https://opencode.ai/). Execute `opencode-remote` dentro de um repositório para iniciar o servidor, acompanhar a atividade em um painel ao vivo e controlar a sessão pelo celular.
 
 ## Recursos
 
-- Lista fechada de projetos autorizados.
+- Instalação global como .NET tool no Windows, Linux e macOS.
+- Detecção automática da raiz do repositório Git atual.
+- Painel ao vivo com conexão, sessão, tarefa, etapa, atividade e alterações.
 - Criação e retomada de sessões persistidas.
 - Seleção de provider e modelo por sessão.
 - Modos Plan e Build usando os agentes nativos do OpenCode.
@@ -12,79 +24,120 @@ Cliente remoto pessoal que conecta o Telegram a sessões locais do [OpenCode](ht
 - Aprovação de permissões e resposta a perguntas interativas pelo Telegram.
 - Conversão de Markdown para HTML compatível com o Telegram.
 - Cancelamento da execução atual com `/stop`.
-- Persistência local da seleção atual.
-- Execução como console ou Windows Service.
+- Persistência independente da seleção de cada projeto.
+- Configuração global interativa com segredos mascarados.
+- Bloqueio de execuções concorrentes usando o mesmo bot e servidor.
 - Reconexão ao Telegram com backoff exponencial.
 
 ## Como funciona
 
 ```text
-Telegram
-   │ comandos e mensagens
-   ▼
+Terminal ──► painel ao vivo
+                ▲
+Telegram        │ estado de runtime
+   │            │
+   ▼            │
 TelegramWorker ──► SessionCoordinator ──► OpenCodeClient ──► API local do OpenCode
    ▲                                                      │
    └────────────── IRemoteNotifier ◄── OpenCodeEventWorker ◄── SSE
                               │
-                              └── StateStore (JSON local)
+                              └── StateStore (JSON por projeto)
 ```
 
 O `OpenCodeProcessWorker` pode iniciar e encerrar `opencode serve` junto com a aplicação. Se você já gerencia essa instância separadamente, desative essa função com `Remote__OpenCode__ManageProcess=false`.
 
-## Requisitos
+## Instalação
 
-- Windows 10 ou superior.
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) para desenvolvimento.
+- Windows, Linux ou macOS.
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 - OpenCode instalado e disponível no `PATH`.
 - Bot criado pelo [BotFather](https://t.me/BotFather).
 - Seu Telegram user ID numérico.
 
-O host genérico do .NET também pode rodar em outros sistemas, mas a instalação como serviço, o caminho padrão do estado e a cobertura atual de testes são orientados ao Windows.
+Enquanto o pacote não estiver publicado no NuGet, gere e instale a ferramenta a partir do repositório:
 
-## Instalação
-
-Clone o repositório e restaure as dependências:
-
-```powershell
+```bash
 git clone https://github.com/ianfelps/opencode-remote.git
-Set-Location opencode-remote
-dotnet restore OpencodeRemote.slnx
+cd opencode-remote
+dotnet pack src/OpencodeRemote -c Release -o artifacts
+dotnet tool install --global --add-source ./artifacts OpenCodeRemote
 ```
 
-Copie a configuração de exemplo:
+Depois que o pacote estiver disponível no NuGet, a instalação será:
 
-```powershell
-Copy-Item .env.example .env
+```bash
+dotnet tool install --global OpenCodeRemote
 ```
 
-Preencha o `.env` com seus dados:
+Configure as credenciais na primeira execução:
 
-```dotenv
-Remote__Telegram__Token=TOKEN_DO_BOT
-Remote__Telegram__AllowedUserId=123456789
-Remote__OpenCode__Password=UMA_SENHA_FORTE
-Remote__Projects__0__Alias=meu-projeto
-Remote__Projects__0__Path=C:\caminho\do\projeto
+```bash
+opencode-remote config
 ```
 
-Para autorizar mais projetos, repita as duas últimas variáveis incrementando o índice: `Remote__Projects__1__Alias`, `Remote__Projects__1__Path` e assim por diante.
+Para atualizar uma instalação feita pelo pacote local:
+
+```bash
+dotnet pack src/OpencodeRemote -c Release -o artifacts
+dotnet tool update --global --add-source ./artifacts OpenCodeRemote
+```
+
+O comando `config` solicita o token do bot, seu Telegram user ID e as credenciais usadas pelo servidor local do OpenCode. Token e senha não são exibidos durante a digitação.
+
+Para revisar a configuração sem revelar os segredos:
+
+```bash
+opencode-remote config show
+```
+
+O arquivo global fica em `%APPDATA%\OpenCodeRemote\config.json` no Windows e no diretório de configuração do usuário no Linux/macOS. Ele contém segredos em texto simples; restrinja o acesso ao seu usuário.
+
+## Execução
+
+Entre no projeto e inicie a CLI:
+
+```bash
+cd meu-projeto
+opencode-remote
+```
+
+A CLI procura uma raiz Git a partir do diretório atual. Também é possível informar explicitamente o diretório:
+
+```bash
+opencode-remote run /caminho/do/projeto
+```
+
+Enquanto o comando estiver aberto, o bot permanece disponível no Telegram. Use `Ctrl+C` para encerrar o Remote e o processo `opencode serve` iniciado por ele.
+
+Para substituir o painel por logs:
+
+```bash
+opencode-remote --no-dashboard
+opencode-remote --verbose
+```
+
+O painel mostra:
+
+- Estado do servidor OpenCode e do Telegram.
+- Projeto, sessão e modo selecionados.
+- Tempo da execução atual.
+- Etapa, ferramenta ativa e resumo das alterações.
+- Esperas por permissão ou resposta no Telegram.
+- Último erro observado.
 
 ## Configuração
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `Remote__Telegram__Token` | vazio | Token fornecido pelo BotFather. |
-| `Remote__Telegram__AllowedUserId` | `0` | Único usuário autorizado a controlar o bot. |
+| `Remote__Telegram__Token` | configurado por `config` | Token fornecido pelo BotFather. |
+| `Remote__Telegram__AllowedUserId` | configurado por `config` | Único usuário autorizado a controlar o bot. |
 | `Remote__OpenCode__BaseUrl` | `http://127.0.0.1:4096` | Endereço da API local do OpenCode. |
 | `Remote__OpenCode__Username` | `opencode` | Usuário da autenticação Basic. |
 | `Remote__OpenCode__Password` | vazio | Senha usada pela API local. |
 | `Remote__OpenCode__Executable` | `opencode` | Executável usado para iniciar o servidor. |
 | `Remote__OpenCode__ManageProcess` | `true` | Define se a aplicação gerencia `opencode serve`. |
-| `Remote__StateFile` | `%LOCALAPPDATA%\OpencodeRemote\state.json` | Arquivo JSON com a seleção persistida. |
-| `Remote__Projects__N__Alias` | nenhum | Nome curto apresentado no Telegram. |
-| `Remote__Projects__N__Path` | nenhum | Caminho absoluto do projeto autorizado. |
 
-Variáveis do sistema têm precedência sobre o `.env`. Durante o desenvolvimento, os segredos também podem ser definidos com .NET User Secrets:
+Variáveis do sistema têm precedência sobre a configuração global. Durante o desenvolvimento, os segredos também podem ser definidos com .NET User Secrets:
 
 ```powershell
 dotnet user-secrets set "Remote:Telegram:Token" "TOKEN_DO_BOT" --project src/OpencodeRemote
@@ -92,10 +145,10 @@ dotnet user-secrets set "Remote:Telegram:AllowedUserId" "123456789" --project sr
 dotnet user-secrets set "Remote:OpenCode:Password" "UMA_SENHA_FORTE" --project src/OpencodeRemote
 ```
 
-## Execução
+Para executar o código-fonte diretamente:
 
-```powershell
-dotnet run --project src/OpencodeRemote
+```bash
+dotnet run --project src/OpencodeRemote -- run /caminho/do/projeto
 ```
 
 Quando `ManageProcess` estiver desativado, inicie o OpenCode separadamente usando o mesmo host, porta e credenciais configurados na aplicação.
@@ -113,7 +166,6 @@ Evite enviar prompts simultâneos para a mesma sessão pela TUI e pelo Telegram.
 | Comando | Ação |
 |---|---|
 | `/start`, `/help` | Exibe a ajuda. |
-| `/projects` | Seleciona um projeto autorizado. |
 | `/session`, `/sessions` | Seleciona uma sessão existente. |
 | `/new` | Cria uma sessão e ativa Build. |
 | `/plan` | Ativa Plan e aceita uma mensagem após o comando. |
@@ -125,34 +177,9 @@ Evite enviar prompts simultâneos para a mesma sessão pela TUI e pelo Telegram.
 | `/stop` | Interrompe a execução atual. |
 | `/clear` | Limpa mensagens removíveis da sessão no Telegram. |
 
-Depois de selecionar projeto e sessão, qualquer mensagem comum é enviada ao OpenCode. Ao concluir uma resposta em Plan, o bot oferece o botão `Implementar este plano`; a implementação só começa após confirmação explícita.
+Depois de selecionar uma sessão, qualquer mensagem comum é enviada ao OpenCode. Ao concluir uma resposta em Plan, o bot oferece o botão `Implementar este plano`; a implementação só começa após confirmação explícita.
 
 `/clear` remove apenas o histórico visual do Telegram. A sessão do OpenCode não é apagada nem reiniciada, e a API do Telegram normalmente limita a remoção a mensagens das últimas 48 horas.
-
-## Windows Service
-
-Publique uma versão framework-dependent:
-
-```powershell
-dotnet publish src/OpencodeRemote -c Release -r win-x64 --self-contained false -o publish
-Copy-Item .env publish\.env
-```
-
-Em um terminal administrativo, registre o executável publicado:
-
-```powershell
-sc.exe create OpenCodeRemote binPath= "C:\caminho\opencode-remote\publish\OpencodeRemote.exe" start= auto
-sc.exe start OpenCodeRemote
-```
-
-Para remover o serviço:
-
-```powershell
-sc.exe stop OpenCodeRemote
-sc.exe delete OpenCodeRemote
-```
-
-O `.env` fica em texto puro. Restrinja as permissões da pasta publicada à sua conta e à conta usada pelo serviço.
 
 ## Desenvolvimento
 
@@ -161,21 +188,32 @@ dotnet restore OpencodeRemote.slnx
 dotnet build OpencodeRemote.slnx
 dotnet test OpencodeRemote.slnx
 dotnet format OpencodeRemote.slnx --verify-no-changes
+dotnet pack src/OpencodeRemote -c Release -o artifacts
+```
+
+Instalação local do pacote gerado:
+
+```bash
+dotnet tool install --global --add-source artifacts OpenCodeRemote
 ```
 
 Estrutura principal:
 
 ```text
 src/OpencodeRemote/
+├── Cli/            Comandos, configuração, projeto e lock
 ├── Configuration/  Opções da aplicação
 ├── OpenCode/       Cliente HTTP, eventos SSE e processo local
 ├── Persistence/    Estado persistido em JSON
+├── Runtime/        Estado e painel ao vivo
 ├── Sessions/       Coordenação e apresentação das sessões
 └── Telegram/       Bot, callbacks, notificações e formatação
 
 tests/OpencodeRemote.Tests/
+├── Cli/
 ├── OpenCode/
 ├── Persistence/
+├── Runtime/
 ├── Sessions/
 ├── Telegram/
 └── TestSupport/
@@ -193,10 +231,10 @@ tests/OpencodeRemote.Tests/
 ## Limitações
 
 - O projeto foi desenhado para um único usuário do Telegram.
-- Projeto e sessão selecionados são mantidos como um único estado global.
+- Apenas uma instância pode usar a configuração global por vez.
+- O comando precisa permanecer aberto; esta versão não instala daemon ou serviço.
 - Botões antigos expiram e deixam de funcionar após reinício da aplicação.
 - A integração depende dos endpoints e eventos da versão instalada do OpenCode.
-- A supervisão atual não reinicia automaticamente o OpenCode se o processo encerrar depois de ficar saudável.
 
 ## Licença
 

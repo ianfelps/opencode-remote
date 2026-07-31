@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using OpencodeRemote.Runtime;
 
 namespace OpencodeRemote.Tests.OpenCode;
 
@@ -138,6 +139,53 @@ public sealed class OpenCodeEventWorkerTests : IDisposable
 
         Assert.True(coordinator.IsLocallyActive("session-1"));
         Assert.Empty(notifier.Messages);
+    }
+
+    [Fact]
+    public async Task IdleFromAnotherSessionDoesNotClearDashboardTask()
+    {
+        Directory.CreateDirectory(_directory);
+        var options = Options.Create(new RemoteOptions
+        {
+            Telegram = new TelegramOptions { Token = "token", AllowedUserId = 1 },
+            Projects = [new ProjectOptions { Alias = "main", Path = _directory }],
+            StateFile = Path.Combine(_directory, "state.json"),
+        });
+        var store = new StateStore(options);
+        await store.SaveAsync(new RemoteState(42, "main", "session-1"), CancellationToken.None);
+        using var client = new OpenCodeClient(options, new StubHttpMessageHandler(request =>
+            request.RequestUri!.AbsolutePath switch
+            {
+                "/session/status" => StubHttpMessageHandler.Json("{}"),
+                "/session/session-1/prompt_async" => new HttpResponseMessage(HttpStatusCode.NoContent),
+                _ => throw new InvalidOperationException($"Unexpected request: {request.RequestUri}"),
+            }));
+        var runtime = new RuntimeStatusStore();
+        var coordinator = new SessionCoordinator(options, store, client, runtime);
+        runtime.SetSelection("session-1", "build");
+        await coordinator.SendPromptAsync("work", CancellationToken.None);
+        var worker = new OpenCodeEventWorker(
+            client,
+            store,
+            coordinator,
+            new RecordingNotifier(),
+            options,
+            NullLogger<OpenCodeEventWorker>.Instance,
+            runtime);
+        using var document = JsonDocument.Parse("""
+            {
+              "directory": "C:\\project",
+              "payload": {
+                "type": "session.idle",
+                "properties": { "sessionID": "another-session" }
+              }
+            }
+            """);
+
+        await worker.HandleEventAsync(document.RootElement, CancellationToken.None);
+
+        Assert.True(runtime.Get().Task?.IsActive);
+        Assert.True(coordinator.IsLocallyActive("session-1"));
     }
 
     [Fact]

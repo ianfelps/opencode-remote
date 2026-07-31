@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Options;
 using OpencodeRemote.Configuration;
 using OpencodeRemote.Persistence;
+using OpencodeRemote.Runtime;
 using OpencodeRemote.Sessions;
 using OpencodeRemote.Sessions.Models;
 using OpencodeRemote.Telegram;
@@ -15,13 +16,31 @@ public sealed class OpenCodeEventWorker(
     SessionCoordinator coordinator,
     IRemoteNotifier notifier,
     IOptions<RemoteOptions> options,
-    ILogger<OpenCodeEventWorker> logger) : BackgroundService
+    ILogger<OpenCodeEventWorker> logger,
+    RuntimeStatusStore? runtime = null,
+    ApplicationExitState? exitState = null) : BackgroundService
 {
     private readonly Dictionary<string, string> _lastResponses = [];
     private readonly HashSet<string> _reportedToolStates = [];
     private readonly TelegramOptions _telegram = options.Value.Telegram;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            await RunAsync(stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+            exitState?.Fail();
+            throw;
+        }
+    }
+
+    private async Task RunAsync(CancellationToken stoppingToken)
     {
         if (string.IsNullOrWhiteSpace(_telegram.Token) || _telegram.AllowedUserId == 0)
         {
@@ -30,6 +49,7 @@ public sealed class OpenCodeEventWorker(
 
         while (!stoppingToken.IsCancellationRequested && !await client.IsHealthyAsync(stoppingToken))
         {
+            runtime?.SetEvents("aguardando OpenCode");
             await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
         }
 
@@ -37,8 +57,10 @@ public sealed class OpenCodeEventWorker(
         {
             try
             {
+                runtime?.SetEvents("conectando");
                 await foreach (var document in client.SubscribeEventsAsync(stoppingToken))
                 {
+                    runtime?.SetEvents("conectado");
                     using (document)
                     {
                         using var eventTimeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
@@ -53,6 +75,7 @@ public sealed class OpenCodeEventWorker(
                         }
                         catch (Exception exception)
                         {
+                            runtime?.SetError(exception.Message);
                             logger.LogWarning(exception, "Evento do OpenCode ignorado após falha de processamento");
                         }
                     }
@@ -66,6 +89,8 @@ public sealed class OpenCodeEventWorker(
             }
             catch (Exception exception)
             {
+                runtime?.SetEvents("reconectando");
+                runtime?.SetError(exception.Message);
                 logger.LogWarning(exception, "Stream de eventos do OpenCode desconectado; tentando novamente");
                 await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
             }
@@ -84,6 +109,7 @@ public sealed class OpenCodeEventWorker(
 
         var directory = directoryElement.GetString() ?? "";
         var type = typeElement.GetString();
+        runtime?.Touch();
         var state = await stateStore.GetAsync(cancellationToken);
         if (state.ChatId == 0)
         {
@@ -97,13 +123,19 @@ public sealed class OpenCodeEventWorker(
                 break;
             case "session.error":
                 var failedSessionId = GetString(properties, "sessionID");
+                if (failedSessionId != state.SessionId)
+                {
+                    break;
+                }
                 if (failedSessionId is not null
                     && await IsStaleTerminalEventAsync(directory, failedSessionId, cancellationToken))
                 {
                     break;
                 }
-                if (failedSessionId is not null)
+                if (failedSessionId is not null && failedSessionId == state.SessionId)
                 {
+                    runtime?.SetAttention(null);
+                    runtime?.SetError("O OpenCode interrompeu a execução.");
                     ClearSessionProgress(failedSessionId);
                 }
                 if (failedSessionId == state.SessionId)
@@ -144,19 +176,17 @@ public sealed class OpenCodeEventWorker(
     private async Task HandleIdleAsync(string directory, JsonElement properties, RemoteState state, CancellationToken cancellationToken)
     {
         var sessionId = GetString(properties, "sessionID");
-        if (sessionId is not null)
-        {
-            if (await IsStaleTerminalEventAsync(directory, sessionId, cancellationToken))
-            {
-                return;
-            }
-            ClearSessionProgress(sessionId);
-        }
-
         if (sessionId is null || sessionId != state.SessionId)
         {
             return;
         }
+
+        if (await IsStaleTerminalEventAsync(directory, sessionId, cancellationToken))
+        {
+            return;
+        }
+        runtime?.SetAttention(null);
+        ClearSessionProgress(sessionId);
 
         await notifier.StopTypingAsync(state.ChatId);
         await ClearProgressBestEffortAsync(state.ChatId, cancellationToken);
@@ -184,6 +214,7 @@ public sealed class OpenCodeEventWorker(
             return;
         }
 
+        runtime?.SetAttention("aguardando permissão no Telegram");
         var title = GetString(properties, "title")
             ?? GetString(properties, "permission")
             ?? GetString(properties, "action")
@@ -202,6 +233,7 @@ public sealed class OpenCodeEventWorker(
             return;
         }
 
+        runtime?.SetAttention("aguardando resposta no Telegram");
         var questions = new List<QuestionPrompt>();
         foreach (var question in questionsElement.EnumerateArray())
         {

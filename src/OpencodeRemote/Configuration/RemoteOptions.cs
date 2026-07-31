@@ -7,7 +7,7 @@ public sealed class RemoteOptions
     public TelegramOptions Telegram { get; init; } = new();
     public OpenCodeOptions OpenCode { get; init; } = new();
     public List<ProjectOptions> Projects { get; init; } = [];
-    public string StateFile { get; init; } = "%LOCALAPPDATA%\\OpencodeRemote\\state.json";
+    public string StateFile { get; set; } = "";
 }
 
 public sealed class TelegramOptions

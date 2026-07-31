@@ -9,7 +9,7 @@ public sealed class SessionCoordinatorTests : IDisposable
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"opencode-remote-coordinator-{Guid.NewGuid():N}");
 
     [Fact]
-    public async Task SelectProjectIsCaseInsensitiveAndClearsPreviousSession()
+    public async Task ActivateProjectIsCaseInsensitiveAndClearsPreviousSession()
     {
         Directory.CreateDirectory(_directory);
         var options = CreateOptions(new ProjectOptions { Alias = "Main", Path = _directory });
@@ -18,14 +18,14 @@ public sealed class SessionCoordinatorTests : IDisposable
         using var client = CreateClient(options, _ => throw new InvalidOperationException("HTTP should not be called."));
         var coordinator = new SessionCoordinator(options, store, client);
 
-        var state = await coordinator.SelectProjectAsync(42, "main", CancellationToken.None);
+        var state = await coordinator.ActivateProjectAsync("main", CancellationToken.None);
 
-        Assert.Equal(new RemoteState(42, "Main", null), state);
+        Assert.Equal(new RemoteState(1, "Main", null), state);
         Assert.Equal(state, await new StateStore(options).GetAsync(CancellationToken.None));
     }
 
     [Fact]
-    public async Task SelectProjectRejectsUnauthorizedAlias()
+    public async Task ActivateProjectRejectsUnauthorizedAlias()
     {
         var options = CreateOptions();
         var store = new StateStore(options);
@@ -33,13 +33,13 @@ public sealed class SessionCoordinatorTests : IDisposable
         var coordinator = new SessionCoordinator(options, store, client);
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => coordinator.SelectProjectAsync(42, "unknown", CancellationToken.None));
+            () => coordinator.ActivateProjectAsync("unknown", CancellationToken.None));
 
         Assert.Equal("Projeto não autorizado.", exception.Message);
     }
 
     [Fact]
-    public async Task SelectProjectRejectsMissingDirectory()
+    public async Task ActivateProjectRejectsMissingDirectory()
     {
         var missing = Path.Combine(_directory, "missing");
         var options = CreateOptions(new ProjectOptions { Alias = "missing", Path = missing });
@@ -48,7 +48,7 @@ public sealed class SessionCoordinatorTests : IDisposable
         var coordinator = new SessionCoordinator(options, store, client);
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => coordinator.SelectProjectAsync(42, "missing", CancellationToken.None));
+            () => coordinator.ActivateProjectAsync("missing", CancellationToken.None));
 
         Assert.Equal("O diretório configurado para o projeto não existe.", exception.Message);
     }
@@ -268,7 +268,7 @@ public sealed class SessionCoordinatorTests : IDisposable
             new OpenCodeModelRef("anthropic", "claude"),
             CancellationToken.None));
 
-        Assert.Contains("projeto ou a sessão", exception.Message);
+        Assert.Contains("sessão selecionada mudou", exception.Message);
         Assert.Null((await store.GetAsync(CancellationToken.None)).ModelSelections);
     }
 

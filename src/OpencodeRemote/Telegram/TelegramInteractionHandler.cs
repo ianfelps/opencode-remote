@@ -25,10 +25,9 @@ public sealed class TelegramInteractionHandler(
 {
     internal const string HelpText = """
         ## OpenCode Remote
-        Selecione um projeto e uma sessão antes de enviar mensagens.
+        Selecione uma sessão antes de enviar mensagens.
 
-        **Projeto e sessão**
-        - `/projects` - seleciona um projeto autorizado
+        **Sessão**
         - `/session` - seleciona uma sessão existente e limpa o chat
         - `/sessions` - alias de `/session`
         - `/new` - cria uma sessão, ativa Build e limpa o chat
@@ -49,7 +48,7 @@ public sealed class TelegramInteractionHandler(
         - `/help` - mostra esta ajuda
         - `/start` - alias de `/help`
 
-        Depois de selecionar projeto e sessão, envie uma mensagem comum para o OpenCode usando o modo atual.
+        Depois de selecionar uma sessão, envie uma mensagem comum para o OpenCode usando o modo atual.
         """;
 
     private readonly TelegramOptions _settings = options.Value.Telegram;
@@ -82,6 +81,8 @@ public sealed class TelegramInteractionHandler(
         {
             return;
         }
+
+        await coordinator.SetChatIdAsync(message.Chat.Id, cancellationToken);
 
         if (string.Equals(text.Trim(), "/stop", StringComparison.OrdinalIgnoreCase))
         {
@@ -186,9 +187,6 @@ public sealed class TelegramInteractionHandler(
             case "/help":
                 await delivery.SendTextAsync(chatId, HelpText, cancellationToken);
                 break;
-            case "/projects":
-                await SendProjectsAsync(chatId, cancellationToken);
-                break;
             case "/session":
             case "/sessions":
                 await EnsureSessionIsIdleAsync(cancellationToken);
@@ -262,29 +260,6 @@ public sealed class TelegramInteractionHandler(
                     cancellationToken);
                 break;
         }
-    }
-
-    private async Task SendProjectsAsync(long chatId, CancellationToken cancellationToken)
-    {
-        if (delivery.Bot is null || coordinator.Projects.Count == 0)
-        {
-            await delivery.SendTextAsync(
-                chatId,
-                "## Projetos indisponíveis\n\nNenhum projeto autorizado foi configurado.",
-                cancellationToken);
-            return;
-        }
-
-        var callbackGroup = delivery.CreateCallbackGroup();
-        var keyboard = new InlineKeyboardMarkup(coordinator.Projects.Select(project => new[]
-        {
-            delivery.Button(project.Alias, new CallbackAction("project", project.Path, Value: project.Alias), callbackGroup),
-        }));
-        await delivery.SendKeyboardAsync(
-            chatId,
-            "## Selecionar projeto\n\nEscolha um dos projetos autorizados:",
-            keyboard,
-            cancellationToken);
     }
 
     private async Task SendSessionsAsync(long chatId, CancellationToken cancellationToken)
@@ -379,7 +354,7 @@ public sealed class TelegramInteractionHandler(
                 Path.GetFullPath(expectedDirectory),
                 StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException("O projeto ou a sessão selecionada mudou. Use /model novamente.");
+            throw new InvalidOperationException("A sessão selecionada mudou. Use /model novamente.");
         }
 
         var providers = await coordinator.ListProvidersAsync(cancellationToken);
@@ -437,20 +412,6 @@ public sealed class TelegramInteractionHandler(
             string? confirmation = null;
             switch (action.Kind)
             {
-                case "project":
-                    var restoreProjectQuestion = questions.SuspendPending(callbackMessage.Chat.Id);
-                    try
-                    {
-                        await coordinator.SelectProjectAsync(callbackMessage.Chat.Id, action.Value!, cancellationToken);
-                    }
-                    catch
-                    {
-                        restoreProjectQuestion?.Invoke();
-                        throw;
-                    }
-                    committed = true;
-                    confirmation = $"## Projeto selecionado\n\n**Projeto:** `{action.Value}`\n\nAgora selecione ou crie uma sessão.";
-                    break;
                 case "session":
                     var restoreSessionQuestion = questions.SuspendPending(callbackMessage.Chat.Id);
                     string selectedAgent;
